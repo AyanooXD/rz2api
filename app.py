@@ -33,7 +33,7 @@ try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     os.system('pip install playwright')
-    os.system('playwright install chromium')
+    os.system('playwright install --with-deps chromium')
     from playwright.sync_api import sync_playwright
 
 try:
@@ -409,10 +409,8 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
             try:
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True, proxy=proxy_config, args=['--no-sandbox'])
-                    page = browser.new_page()
-                    page.set_extra_http_headers({
-                        'User-Agent': FingerprintGenerator.get_user_agent()
-                    })
+                    ua = FingerprintGenerator.get_user_agent()
+                    page = browser.new_page(user_agent=ua)
                     page.goto(site_url, timeout=45000, wait_until='networkidle')
                     
                     merchant_data = page.evaluate("""
@@ -483,10 +481,8 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
         
         # 5. Get browser
         browser = get_shared_browser(proxy_config)
-        page = browser.new_page()
-        page.set_extra_http_headers({
-            'User-Agent': FingerprintGenerator.get_user_agent()
-        })
+        ua = FingerprintGenerator.get_user_agent()
+        page = browser.new_page(user_agent=ua)
         
         # 6. Get session token
         session_token = None
