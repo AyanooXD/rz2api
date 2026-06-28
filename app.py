@@ -326,12 +326,24 @@ def get_shared_browser(proxy_config=None):
                     _shared_playwright.stop()
             except Exception:
                 pass
-            _shared_playwright = sync_playwright().start()
-            _shared_browser = _shared_playwright.chromium.launch(
-                headless=True,
-                proxy=proxy_config,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            )
+            try:
+                _shared_playwright = sync_playwright().start()
+                _shared_browser = _shared_playwright.chromium.launch(
+                    headless=True,
+                    proxy=proxy_config,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-setuid-sandbox',
+                        '--single-process',
+                        '--no-zygote'
+                    ]
+                )
+            except Exception as e:
+                _shared_playwright = None
+                _shared_browser = None
+                raise RuntimeError(f"Chromium launch failed: {str(e)}")
         return _shared_browser
 
 def close_shared_browser():
@@ -950,12 +962,25 @@ def razorpay_checker_parallel():
 
 @app.route('/razorpay_health', methods=['GET'])
 def razorpay_health():
-    return jsonify({
+    browser_status = "disconnected"
+    browser_error = None
+    try:
+        browser = get_shared_browser()
+        if browser and browser.is_connected():
+            browser_status = "connected"
+    except Exception as e:
+        browser_status = "error"
+        browser_error = str(e)
+    
+    response = {
         "status": "online",
         "timestamp": get_full_timestamp(),
         "version": "2.0",
-        "browser_status": "connected" if _shared_browser and _shared_browser.is_connected() else "disconnected"
-    })
+        "browser_status": browser_status
+    }
+    if browser_error:
+        response["browser_error"] = browser_error
+    return jsonify(response)
 
 if __name__ == "__main__":
     import atexit
