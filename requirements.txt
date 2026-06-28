@@ -6,3 +6,5 @@ beautifulsoup4==4.12.2
 Faker==20.1.0
 pysocks==1.7.1
 gunicorn==21.2.0
+greenlet>=3.0.3
+
