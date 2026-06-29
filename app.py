@@ -404,6 +404,7 @@ def close_shared_browser():
 def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', proxy_str=None, proxy_manager=None):
     """Charge a card via Razorpay using pure requests — no browser needed."""
     import re as _re
+    import json as _json
 
     start_time = time.time()
     result = {
@@ -490,19 +491,57 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
         merchant_data = FALLBACK_MERCHANT
         if site_url:
             try:
-                r    = sess.get(site_url, timeout=20)
+                r    = sess.get(site_url, allow_redirects=True, timeout=20)
                 html = r.text
-                kh   = _re.search(r'keyless_header.{0,8}([A-Za-z0-9+/=:]{20,})', html)
-                ki   = _re.search(r'(rzp_live_[A-Za-z0-9]+|rzp_test_[A-Za-z0-9]+)', html)
-                pl   = _re.search(r'(pl_[A-Za-z0-9]+)', html)
-                ppi  = _re.search(r'(ppi_[A-Za-z0-9]+)', html)
-                if kh and ki:
-                    merchant_data = {
-                        'keyless_header':       kh.group(1),
-                        'key_id':               ki.group(1),
-                        'payment_link_id':      pl.group(1) if pl else FALLBACK_MERCHANT['payment_link_id'],
-                        'payment_page_item_id': ppi.group(1) if ppi else FALLBACK_MERCHANT['payment_page_item_id'],
-                    }
+
+                # Strategy 1: Parse var data = {...} JSON (razorpay.me pages)
+                _data_m = _re.search(r'var data\s*=\s*(\{.+?\})\s*;', html, _re.DOTALL)
+                if _data_m:
+                    try:
+                        _d = _json.loads(_data_m.group(1))
+                        _kh  = _d.get('keyless_header', '')
+                        _kid = _d.get('key_id', '')
+                        _pl  = _d.get('payment_link', {})
+                        _ppi = (_pl.get('payment_page_items') or [{}])[0]
+                        if _kh and _kid and _pl.get('id') and _ppi.get('id'):
+                            merchant_data = {
+                                'keyless_header':       _kh,
+                                'key_id':               _kid,
+                                'payment_link_id':      _pl['id'],
+                                'payment_page_item_id': _ppi['id'],
+                            }
+                    except Exception:
+                        pass
+
+                # Strategy 2: JSON pattern in scripts (standard payment pages)
+                if merchant_data is FALLBACK_MERCHANT:
+                    _kh_m  = _re.search(r'"keyless_header"\s*:\s*"([^"]+)"', html)
+                    _kid_m = _re.search(r'"key_id"\s*:\s*"(rzp_[^"]+)"', html)
+                    _pl_m  = _re.search(r'"id"\s*:\s*"(pl_[A-Za-z0-9]+)"', html)
+                    _ppi_m = _re.search(r'"id"\s*:\s*"(ppi_[A-Za-z0-9]+)"', html)
+                    if _kh_m and _kid_m:
+                        # Unescape JSON string (handle \/)
+                        _kh_val = _kh_m.group(1).replace('\\/', '/')
+                        merchant_data = {
+                            'keyless_header':       _kh_val,
+                            'key_id':               _kid_m.group(1),
+                            'payment_link_id':      _pl_m.group(1) if _pl_m else FALLBACK_MERCHANT['payment_link_id'],
+                            'payment_page_item_id': _ppi_m.group(1) if _ppi_m else FALLBACK_MERCHANT['payment_page_item_id'],
+                        }
+
+                # Strategy 3: Simple pattern fallback
+                if merchant_data is FALLBACK_MERCHANT:
+                    kh  = _re.search(r'(pl_[A-Za-z0-9]+)', html)
+                    ppi = _re.search(r'(ppi_[A-Za-z0-9]+)', html)
+                    ki  = _re.search(r'(rzp_live_[A-Za-z0-9]+|rzp_test_[A-Za-z0-9]+)', html)
+                    if ki:
+                        merchant_data = {
+                            'keyless_header':       FALLBACK_MERCHANT['keyless_header'],
+                            'key_id':               ki.group(1),
+                            'payment_link_id':      kh.group(1) if kh else FALLBACK_MERCHANT['payment_link_id'],
+                            'payment_page_item_id': ppi.group(1) if ppi else FALLBACK_MERCHANT['payment_page_item_id'],
+                        }
+
             except Exception:
                 pass  # Use fallback
 
