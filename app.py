@@ -525,7 +525,7 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
                 'https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1',
                 allow_redirects=True, timeout=30
             )
-            st_match = _re.search(r'window[.]session_token[\s]*=[\s]*[^A-Fa-f0-9]*([A-Fa-f0-9]{40,})', st_resp.text)
+            st_match = _re.search(r'window\.session_token\s*=\s*"([^"]+)"', st_resp.text)
             if st_match:
                 session_token = st_match.group(1)
             else:
@@ -571,7 +571,7 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
 
         result['order_id'] = order_id
 
-        # 8. Submit payment
+        # 8. Submit payment (with 1 retry on auth failure)
         qs = {'key_id': key_id, 'session_token': session_token, 'keyless_header': keyless_header}
         pay_payload = {
             'notes[comment]': '',
@@ -617,6 +617,35 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
             result['error'] = f'Payment submit error: {str(e)[:100]}'
             result['time'] = round(time.time() - start_time, 2)
             return result
+
+        # 8b. Retry once if auth failed (fresh session_token)
+        if isinstance(pay_resp, requests.Response):
+            _tmp = {}
+            try: _tmp = pay_resp.json()
+            except: pass
+            _err = _tmp.get('error', {})
+            if (_err.get('code') == 'BAD_REQUEST_ERROR' and
+                    'authentication' in _err.get('description', '').lower()):
+                # Get fresh session token and retry
+                try:
+                    _st2 = sess.get(
+                        'https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1',
+                        allow_redirects=True, timeout=30)
+                    _m2 = _re.search(r'window\.session_token\s*=\s*"([^"]+)"', _st2.text)
+                    if _m2:
+                        session_token = _m2.group(1)
+                        qs['session_token'] = session_token
+                        pay_resp = sess.post(
+                            'https://api.razorpay.com/v1/standard_checkout/payments/create/ajax',
+                            params=qs,
+                            headers={'x-session-token': session_token,
+                                     'Content-Type': 'application/x-www-form-urlencoded',
+                                     'Accept': 'application/json, text/plain, */*',
+                                     'Origin': 'https://razorpay.com',
+                                     'Referer': 'https://razorpay.com/'},
+                            data=pay_payload, timeout=45)
+                except Exception:
+                    pass
 
         # 9. Extract payment_id
         payment_id = None
